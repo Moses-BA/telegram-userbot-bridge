@@ -28,6 +28,14 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
+# Health Check Handler for Render & UptimeRobot
+async def health_check_handler(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "telegram-userbot-bridge",
+        "loaded_accounts": list(clients.keys())
+    })
+
 # Inbound Group Message Listener
 async def register_listeners():
     if not clients:
@@ -47,7 +55,8 @@ async def register_listeners():
             "chat_id": message.chat.id
         }
         try:
-            requests.post(N8N_WEBHOOK_URL, json=payload, timeout=5)
+            # Wrapped in asyncio.to_thread so HTTP requests don't freeze the Pyrogram listener
+            await asyncio.to_thread(requests.post, N8N_WEBHOOK_URL, json=payload, timeout=5)
         except Exception as e:
             print(f"Error sending payload to n8n: {e}")
 
@@ -84,6 +93,10 @@ async def main():
     await register_listeners()
 
     app = web.Application()
+
+    # Registered routes
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
     app.router.add_post("/send", send_message_handler)
 
     runner = web.AppRunner(app)
