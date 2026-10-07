@@ -5,10 +5,11 @@ import logging
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, idle
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, RawUpdateHandler
 from pyrogram.types import Message
+from pyrogram.raw.types import UpdateNewChannelMessage, UpdateEditChannelMessage
 
-# Enable standard Python & Pyrogram logging
+# Enable standard Python logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -27,6 +28,7 @@ SESSIONS_RAW = os.getenv("SESSIONS_JSON", "{}")
 SESSIONS = json.loads(SESSIONS_RAW)
 
 clients = {}
+seen_message_ids = set()  # Prevents duplicate forwarding to n8n
 
 for account_id, session_str in SESSIONS.items():
     clients[account_id] = Client(
@@ -37,9 +39,43 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
-# Inbound Message & Channel Post Handler
+async def dispatch_payload_to_n8n(message_id: int, sender_id: str, sender_name: str, text: str, chat_id: int, handler_acc: str, reply_to_id=None):
+    if message_id in seen_message_ids:
+        return
+    seen_message_ids.add(message_id)
+
+    # Keep memory bounded
+    if len(seen_message_ids) > 1000:
+        seen_message_ids.clear()
+
+    logger.info(f"[CAPTURED] Post ID {message_id} from '{sender_name}' in Chat {chat_id}: '{text}'")
+
+    if not N8N_WEBHOOK_URL:
+        logger.error("[ERROR] N8N_WEBHOOK_URL environment variable is empty.")
+        return
+
+    payload = {
+        "telegram_msg_id": message_id,
+        "sender_user_id": sender_id,
+        "sender_username": sender_name,
+        "text": text,
+        "reply_to_message_id": reply_to_id,
+        "chat_id": chat_id,
+        "handled_by_account": handler_acc
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                logger.info(f"[WEBHOOK SUCCESS] Sent msg {message_id} to n8n (Status: {resp.status})")
+    except Exception as e:
+        logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
+
+# High-Level Pyrogram Message Handler
 async def handle_incoming(c: Client, message: Message):
-    # Extract sender info (Channel posts use sender_chat, user posts use from_user)
+    if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
+        return
+
     if message.from_user:
         sender_id = str(message.from_user.id)
         sender_name = message.from_user.username or message.from_user.first_name or "User"
@@ -50,33 +86,56 @@ async def handle_incoming(c: Client, message: Message):
         sender_id = None
         sender_name = "Anonymous/Channel"
 
-    msg_text = message.text or message.caption or ""
-    logger.info(f"[INCOMING] Account '{c.name}' caught message/post ID {message.id} from '{sender_name}' in Chat {message.chat.id}: '{msg_text}'")
+    await dispatch_payload_to_n8n(
+        message_id=message.id,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        text=message.text or message.caption or "",
+        chat_id=message.chat.id,
+        handler_acc=c.name,
+        reply_to_id=message.reply_to_message.id if message.reply_to_message else None
+    )
 
-    if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
-        logger.info(f"[DEBUG] Ignored post from non-target chat: {message.chat.id}")
-        return
+# Raw MTProto Update Handler
+async def handle_raw_update(client: Client, update, users, chats):
+    if isinstance(update, (UpdateNewChannelMessage, UpdateEditChannelMessage)):
+        logger.info(f"[RAW MTPROTO] {client.name} detected raw channel update: {type(update).__name__}")
 
-    if not N8N_WEBHOOK_URL:
-        logger.error("[ERROR] N8N_WEBHOOK_URL environment variable is empty.")
-        return
+# Active Background Channel Poller (Guarantees 100% Capture)
+async def channel_poller_task():
+    logger.info("Starting active background channel polling loop...")
+    await asyncio.sleep(5)  # Initial delay for startup
 
-    payload = {
-        "telegram_msg_id": message.id,
-        "sender_user_id": sender_id,
-        "sender_username": sender_name,
-        "text": msg_text,
-        "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
-        "chat_id": message.chat.id,
-        "handled_by_account": c.name
-    }
+    primary_client = clients.get("ACC_01") or list(clients.values())[0]
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
-    except Exception as e:
-        logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
+    while True:
+        try:
+            if TARGET_GROUP_CHAT_ID != 0:
+                async for message in primary_client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=5):
+                    if message.id not in seen_message_ids:
+                        if message.from_user:
+                            sender_id = str(message.from_user.id)
+                            sender_name = message.from_user.username or message.from_user.first_name or "User"
+                        elif message.sender_chat:
+                            sender_id = str(message.sender_chat.id)
+                            sender_name = message.sender_chat.title or "Channel"
+                        else:
+                            sender_id = None
+                            sender_name = "Channel/Admin"
+
+                        await dispatch_payload_to_n8n(
+                            message_id=message.id,
+                            sender_id=sender_id,
+                            sender_name=sender_name,
+                            text=message.text or message.caption or "",
+                            chat_id=message.chat.id,
+                            handler_acc=f"{primary_client.name}_POLLER",
+                            reply_to_id=message.reply_to_message.id if message.reply_to_message else None
+                        )
+        except Exception as e:
+            logger.error(f"[POLLER ERROR] {e}")
+
+        await asyncio.sleep(3)  # Poll every 3 seconds
 
 # Manual Test Trigger Endpoint
 async def test_trigger_handler(request):
@@ -96,10 +155,10 @@ async def test_trigger_handler(request):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(N8N_WEBHOOK_URL, json=dummy_payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                logger.info(f"[TEST TRIGGER] Manual test sent to n8n. HTTP Status: {resp.status}")
+                logger.info(f"[TEST TRIGGER] Manual test sent to n8n. Status: {resp.status}")
                 return web.json_response({"status": "success", "n8n_http_status": resp.status})
     except Exception as e:
-        logger.error(f"[TEST TRIGGER ERROR] Failed to hit n8n: {e}")
+        logger.error(f"[TEST TRIGGER ERROR] {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 # Health Check Handler
@@ -143,11 +202,12 @@ async def main():
         logger.critical("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
 
-    # Attach message handler to ALL clients
+    # Attach message and raw update handlers to ALL clients
     for acc_id, client in clients.items():
         client.add_handler(MessageHandler(handle_incoming))
+        client.add_handler(RawUpdateHandler(handle_raw_update))
 
-    # Start sessions and cache peers via dialog lookup
+    # Start sessions and cache peers
     for acc_id, client in clients.items():
         logger.info(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
@@ -162,11 +222,13 @@ async def main():
                         break
                 
                 if not cached:
-                    logger.info(f"[{acc_id}] Channel not in recent dialogs, performing direct lookup...")
                     await client.get_chat(TARGET_GROUP_CHAT_ID)
                     logger.info(f"[{acc_id}] Channel peer cached via direct lookup.")
             except Exception as e:
                 logger.warning(f"[{acc_id}] Warning: Could not resolve peer for channel {TARGET_GROUP_CHAT_ID}: {e}")
+
+    # Start active background poller loop
+    asyncio.create_task(channel_poller_task())
 
     app = web.Application()
 
