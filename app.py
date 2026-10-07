@@ -4,19 +4,17 @@ import asyncio
 import logging
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
+from pyrogram.errors import UserAlreadyParticipant, RPCError
 
-# Enable standard Python & Pyrogram DEBUG logging
+# Enable standard Python & Pyrogram logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("telegram-bridge")
-
-# Set Pyrogram dispatcher to DEBUG to catch raw network packets
-logging.getLogger("pyrogram.dispatcher").setLevel(logging.DEBUG)
 
 # Load environment variables
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -40,13 +38,24 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
-# Inbound Message Handler
+# Inbound Message & Channel Post Handler
 async def handle_incoming(c: Client, message: Message):
-    sender_name = message.from_user.username if message.from_user else "Unknown"
-    logger.info(f"[INCOMING] Account '{c.name}' caught message ID {message.id} from @{sender_name} in Chat {message.chat.id}: '{message.text or message.caption or ''}'")
+    # Extract sender info (Channel posts use sender_chat, user posts use from_user)
+    if message.from_user:
+        sender_id = str(message.from_user.id)
+        sender_name = message.from_user.username or message.from_user.first_name or "User"
+    elif message.sender_chat:
+        sender_id = str(message.sender_chat.id)
+        sender_name = message.sender_chat.title or "Channel"
+    else:
+        sender_id = None
+        sender_name = "Anonymous/Channel"
+
+    msg_text = message.text or message.caption or ""
+    logger.info(f"[INCOMING] Account '{c.name}' caught channel post ID {message.id} from '{sender_name}' in Chat {message.chat.id}: '{msg_text}'")
 
     if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
-        logger.info(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
+        logger.info(f"[DEBUG] Ignored post from non-target chat: {message.chat.id}")
         return
 
     if not N8N_WEBHOOK_URL:
@@ -55,9 +64,9 @@ async def handle_incoming(c: Client, message: Message):
 
     payload = {
         "telegram_msg_id": message.id,
-        "sender_user_id": str(message.from_user.id) if message.from_user else None,
+        "sender_user_id": sender_id,
         "sender_username": sender_name,
-        "text": message.text or message.caption or "",
+        "text": msg_text,
         "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
         "chat_id": message.chat.id,
         "handled_by_account": c.name
@@ -66,7 +75,7 @@ async def handle_incoming(c: Client, message: Message):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
+                logger.info(f"[WEBHOOK] Forwarded channel post {message.id} to n8n (HTTP Status: {resp.status})")
     except Exception as e:
         logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
 
@@ -78,7 +87,7 @@ async def test_trigger_handler(request):
     dummy_payload = {
         "telegram_msg_id": 99999,
         "sender_user_id": "123456789",
-        "sender_username": "test_user",
+        "sender_username": "channel_admin",
         "text": "Manual trigger test from Render bridge",
         "reply_to_message_id": None,
         "chat_id": TARGET_GROUP_CHAT_ID,
@@ -135,41 +144,30 @@ async def main():
         logger.critical("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
 
-    # Explicitly register handlers on every client
+    # Attach message handler to ALL clients
     for acc_id, client in clients.items():
         client.add_handler(MessageHandler(handle_incoming))
 
-    # Start sessions and cache group peers
+    # Start sessions and ensure channel subscription/peer caching
     for acc_id, client in clients.items():
         logger.info(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
 
         if TARGET_GROUP_CHAT_ID != 0:
             try:
-                cached = False
-                async for dialog in client.get_dialogs(limit=100):
-                    if dialog.chat.id == TARGET_GROUP_CHAT_ID:
-                        logger.info(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
-                        cached = True
-                        break
-                
-                if not cached:
-                    await client.get_chat(TARGET_GROUP_CHAT_ID)
-                    logger.info(f"[{acc_id}] Group peer cached via direct lookup.")
-            except Exception as e:
-                logger.warning(f"[{acc_id}] Warning: Could not resolve peer for group {TARGET_GROUP_CHAT_ID}: {e}")
+                # Attempt to join/subscribe to the channel to activate push updates
+                await client.join_chat(TARGET_GROUP_CHAT_ID)
+                logger.info(f"[{acc_id}] Joined/Subscribed to channel {TARGET_GROUP_CHAT_ID}")
+            except UserAlreadyParticipant:
+                logger.info(f"[{acc_id}] Already subscribed to channel {TARGET_GROUP_CHAT_ID}")
+            except RPCError as e:
+                logger.info(f"[{acc_id}] Peer caching lookup ({e})")
 
-    # Outbound Self-Test: ACC_01 posts to group to trigger ACC_02-ACC_05
-    if "ACC_01" in clients and TARGET_GROUP_CHAT_ID != 0:
-        try:
-            logger.info("Sending automated startup test message from ACC_01...")
-            sent = await clients["ACC_01"].send_message(
-                chat_id=TARGET_GROUP_CHAT_ID,
-                text="🤖 Bridge online: Automated inbound test message."
-            )
-            logger.info(f"Startup message posted by ACC_01 (Msg ID: {sent.id})")
-        except Exception as e:
-            logger.error(f"Failed to post startup test message: {e}")
+            try:
+                await client.get_chat(TARGET_GROUP_CHAT_ID)
+                logger.info(f"[{acc_id}] Channel peer cached successfully.")
+            except Exception as e:
+                logger.warning(f"[{acc_id}] Could not resolve peer for channel {TARGET_GROUP_CHAT_ID}: {e}")
 
     app = web.Application()
 
