@@ -1,9 +1,10 @@
 import os
 import json
 import asyncio
-import requests
+import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters
+from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
 # Load environment variables
@@ -28,37 +29,40 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
+# Inbound Group Message Handler
+async def handle_incoming(client: Client, message: Message):
+    sender_name = message.from_user.username if message.from_user else "Unknown"
+    print(f"[INCOMING] Captured group message ID {message.id} from @{sender_name}: '{message.text or message.caption or ''}'")
+
+    if not N8N_WEBHOOK_URL:
+        print("[ERROR] N8N_WEBHOOK_URL environment variable is empty. Message not forwarded.")
+        return
+
+    payload = {
+        "telegram_msg_id": message.id,
+        "sender_user_id": str(message.from_user.id) if message.from_user else None,
+        "sender_username": sender_name,
+        "text": message.text or message.caption or "",
+        "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
+        "chat_id": message.chat.id
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                print(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
+    except Exception as e:
+        print(f"[ERROR] Failed to forward payload to n8n: {e}")
+
 # Health Check Handler for Render & UptimeRobot
 async def health_check_handler(request):
     return web.json_response({
         "status": "ok",
         "service": "telegram-userbot-bridge",
-        "loaded_accounts": list(clients.keys())
+        "loaded_accounts": list(clients.keys()),
+        "target_group_id": TARGET_GROUP_CHAT_ID,
+        "webhook_configured": bool(N8N_WEBHOOK_URL)
     })
-
-# Inbound Group Message Listener
-async def register_listeners():
-    if not clients:
-        print("No active client sessions found.")
-        return
-
-    primary_client = list(clients.values())[0]
-
-    @primary_client.on_message(filters.chat(TARGET_GROUP_CHAT_ID))
-    async def handle_incoming(client: Client, message: Message):
-        payload = {
-            "telegram_msg_id": message.id,
-            "sender_user_id": str(message.from_user.id) if message.from_user else None,
-            "sender_username": message.from_user.username if message.from_user else "Unknown",
-            "text": message.text or message.caption or "",
-            "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
-            "chat_id": message.chat.id
-        }
-        try:
-            # Wrapped in asyncio.to_thread so HTTP requests don't freeze the Pyrogram listener
-            await asyncio.to_thread(requests.post, N8N_WEBHOOK_URL, json=payload, timeout=5)
-        except Exception as e:
-            print(f"Error sending payload to n8n: {e}")
 
 # Outbound Reply Handler
 async def send_message_handler(request):
@@ -83,14 +87,38 @@ async def send_message_handler(request):
             "account_id": account_id
         })
     except Exception as e:
+        print(f"[ERROR] /send endpoint failed: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def main():
+    if not clients:
+        print("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
+        return
+
+    # Attach event listener to primary account BEFORE clients start
+    primary_acc_id, primary_client = list(clients.items())[0]
+    print(f"Registering inbound message listener on primary account: {primary_acc_id}")
+    
+    if TARGET_GROUP_CHAT_ID != 0:
+        primary_client.add_handler(
+            MessageHandler(handle_incoming, filters.chat(TARGET_GROUP_CHAT_ID))
+        )
+    else:
+        print("[WARNING] TARGET_GROUP_CHAT_ID is set to 0! Listening on all chats without filter.")
+        primary_client.add_handler(MessageHandler(handle_incoming))
+
+    # Start sessions and warm up peer cache for every client
     for acc_id, client in clients.items():
-        print(f"Starting session for {acc_id}...")
+        print(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
 
-    await register_listeners()
+        if TARGET_GROUP_CHAT_ID != 0:
+            try:
+                # Forces Pyrogram to resolve and cache the group peer on startup
+                await client.get_chat(TARGET_GROUP_CHAT_ID)
+                print(f"[{acc_id}] Group peer cached successfully for {TARGET_GROUP_CHAT_ID}")
+            except Exception as e:
+                print(f"[{acc_id}] Warning: Could not cache peer for group {TARGET_GROUP_CHAT_ID}: {e}")
 
     app = web.Application()
 
