@@ -1,11 +1,18 @@
 import os
 import json
 import asyncio
+import logging
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
+
+# Enable standard Python logging for Pyrogram background tasks
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("telegram-bridge")
 
 # Load environment variables
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -29,38 +36,39 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
-# Inbound Message Handler (Catch-All)
-async def handle_incoming(client: Client, message: Message):
-    sender_name = message.from_user.username if message.from_user else "Unknown"
-    print(f"[INCOMING] Account '{client.name}' caught message from @{sender_name} in Chat ID ({message.chat.id}): '{message.text or message.caption or ''}'")
+# Register message handlers on every client session
+for acc_id, client in clients.items():
+    @client.on_message()
+    async def handle_incoming(c: Client, message: Message):
+        sender_name = message.from_user.username if message.from_user else "Unknown"
+        logger.info(f"[INCOMING] Account '{c.name}' received message ID {message.id} from @{sender_name} in Chat {message.chat.id}: '{message.text or message.caption or ''}'")
 
-    # Filter out messages not from our target group if configured
-    if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
-        print(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
-        return
+        if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
+            logger.info(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
+            return
 
-    if not N8N_WEBHOOK_URL:
-        print("[ERROR] N8N_WEBHOOK_URL environment variable is empty. Message not forwarded.")
-        return
+        if not N8N_WEBHOOK_URL:
+            logger.error("[ERROR] N8N_WEBHOOK_URL environment variable is empty.")
+            return
 
-    payload = {
-        "telegram_msg_id": message.id,
-        "sender_user_id": str(message.from_user.id) if message.from_user else None,
-        "sender_username": sender_name,
-        "text": message.text or message.caption or "",
-        "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
-        "chat_id": message.chat.id,
-        "handled_by_account": client.name
-    }
+        payload = {
+            "telegram_msg_id": message.id,
+            "sender_user_id": str(message.from_user.id) if message.from_user else None,
+            "sender_username": sender_name,
+            "text": message.text or message.caption or "",
+            "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
+            "chat_id": message.chat.id,
+            "handled_by_account": c.name
+        }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                print(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
-    except Exception as e:
-        print(f"[ERROR] Failed to forward payload to n8n: {e}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
 
-# Manual Test Trigger Endpoint (Render -> n8n Verification)
+# Manual Test Trigger Endpoint
 async def test_trigger_handler(request):
     if not N8N_WEBHOOK_URL:
         return web.json_response({"status": "error", "message": "N8N_WEBHOOK_URL is empty"}, status=400)
@@ -78,10 +86,10 @@ async def test_trigger_handler(request):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(N8N_WEBHOOK_URL, json=dummy_payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                print(f"[TEST TRIGGER] Manual test sent to n8n. HTTP Status: {resp.status}")
+                logger.info(f"[TEST TRIGGER] Manual test sent to n8n. HTTP Status: {resp.status}")
                 return web.json_response({"status": "success", "n8n_http_status": resp.status})
     except Exception as e:
-        print(f"[TEST TRIGGER ERROR] Failed to hit n8n: {e}")
+        logger.error(f"[TEST TRIGGER ERROR] Failed to hit n8n: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 # Health Check Handler
@@ -117,21 +125,17 @@ async def send_message_handler(request):
             "account_id": account_id
         })
     except Exception as e:
-        print(f"[ERROR] /send endpoint failed: {e}")
+        logger.error(f"[ERROR] /send endpoint failed: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def main():
     if not clients:
-        print("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
+        logger.critical("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
-
-    # Attach unfiltered message handler to ALL clients
-    for acc_id, client in clients.items():
-        client.add_handler(MessageHandler(handle_incoming))
 
     # Start sessions and cache peers
     for acc_id, client in clients.items():
-        print(f"Starting Pyrogram session for {acc_id}...")
+        logger.info(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
 
         if TARGET_GROUP_CHAT_ID != 0:
@@ -139,7 +143,7 @@ async def main():
                 cached = False
                 async for dialog in client.get_dialogs(limit=100):
                     if dialog.chat.id == TARGET_GROUP_CHAT_ID:
-                        print(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
+                        logger.info(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
                         cached = True
                         async for _ in client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=1):
                             pass
@@ -147,9 +151,9 @@ async def main():
                 
                 if not cached:
                     await client.get_chat(TARGET_GROUP_CHAT_ID)
-                    print(f"[{acc_id}] Group peer cached via direct lookup.")
+                    logger.info(f"[{acc_id}] Group peer cached via direct lookup.")
             except Exception as e:
-                print(f"[{acc_id}] Warning: Could not resolve peer for group {TARGET_GROUP_CHAT_ID}: {e}")
+                logger.warning(f"[{acc_id}] Warning: Could not resolve peer for group {TARGET_GROUP_CHAT_ID}: {e}")
 
     app = web.Application()
 
@@ -162,10 +166,10 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
-    print(f"Bridge active on port {PORT}...")
+    logger.info(f"Bridge active on port {PORT}...")
     await site.start()
 
-    print("Pyrogram active. Entering idle event loop...")
+    logger.info("Pyrogram active. Entering idle event loop...")
     await idle()
 
 if __name__ == "__main__":
