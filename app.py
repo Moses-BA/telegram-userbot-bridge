@@ -32,9 +32,116 @@ for account_id, session_str in SESSIONS.items():
 # Inbound Group Message Handler
 async def handle_incoming(client: Client, message: Message):
     sender_name = message.from_user.username if message.from_user else "Unknown"
-    print(f"[INCOMING] Captured group message ID {message.id} from @{sender_name}: '{message.text or message.caption or ''}'")
+    print(f"[INCOMING] Account '{client.name}' caught message from @{sender_name} in Chat ID ({message.chat.id}): '{message.text or message.caption or ''}'")
+
+    # Filter out messages not from our target chat
+    if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
+        print(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
+        return
 
     if not N8N_WEBHOOK_URL:
+        print("[ERROR] N8N_WEBHOOK_URL environment variable is empty. Message not forwarded.")
+        return
+
+    payload = {
+        "telegram_msg_id": message.id,
+        "sender_user_id": str(message.from_user.id) if message.from_user else None,
+        "sender_username": sender_name,
+        "text": message.text or message.caption or "",
+        "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
+        "chat_id": message.chat.id,
+        "handled_by_account": client.name
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                print(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
+    except Exception as e:
+        print(f"[ERROR] Failed to forward payload to n8n: {e}")
+
+# Health Check Handler for Render & UptimeRobot
+async def health_check_handler(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "telegram-userbot-bridge",
+        "loaded_accounts": list(clients.keys()),
+        "target_group_id": TARGET_GROUP_CHAT_ID,
+        "webhook_configured": bool(N8N_WEBHOOK_URL)
+    })
+
+# Outbound Reply Handler
+async def send_message_handler(request):
+    try:
+        data = await request.json()
+        account_id = data.get("account_id")
+        text = data.get("text")
+        reply_to_id = data.get("reply_to_id")
+
+        client = clients.get(account_id)
+        if not client:
+            return web.json_response({"status": "error", "message": f"Account {account_id} not loaded"}, status=400)
+
+        sent_msg = await client.send_message(
+            chat_id=TARGET_GROUP_CHAT_ID,
+            text=text,
+            reply_to_message_id=reply_to_id
+        )
+        return web.json_response({
+            "status": "success",
+            "telegram_msg_id": sent_msg.id,
+            "account_id": account_id
+        })
+    except Exception as e:
+        print(f"[ERROR] /send endpoint failed: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def main():
+    if not clients:
+        print("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
+        return
+
+    # Attach listener to ALL accounts without Pyrogram-level chat filters
+    for acc_id, client in clients.items():
+        client.add_handler(MessageHandler(handle_incoming, filters.group | filters.private))
+
+    # Start sessions and warm up peer cache
+    for acc_id, client in clients.items():
+        print(f"Starting Pyrogram session for {acc_id}...")
+        await client.start()
+
+        if TARGET_GROUP_CHAT_ID != 0:
+            try:
+                cached = False
+                async for dialog in client.get_dialogs(limit=100):
+                    if dialog.chat.id == TARGET_GROUP_CHAT_ID:
+                        print(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
+                        cached = True
+                        break
+                
+                if not cached:
+                    await client.get_chat(TARGET_GROUP_CHAT_ID)
+                    print(f"[{acc_id}] Group peer cached via direct lookup.")
+            except Exception as e:
+                print(f"[{acc_id}] Warning: Could not resolve peer for group {TARGET_GROUP_CHAT_ID}: {e}")
+
+    app = web.Application()
+
+    # Registered routes
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
+    app.router.add_post("/send", send_message_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    print(f"Bridge active on port {PORT}...")
+    await site.start()
+
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())    if not N8N_WEBHOOK_URL:
         print("[ERROR] N8N_WEBHOOK_URL environment variable is empty. Message not forwarded.")
         return
 
