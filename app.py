@@ -7,7 +7,6 @@ from aiohttp import web
 from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
-from pyrogram.errors import UserAlreadyParticipant, RPCError
 
 # Enable standard Python & Pyrogram logging
 logging.basicConfig(
@@ -52,7 +51,7 @@ async def handle_incoming(c: Client, message: Message):
         sender_name = "Anonymous/Channel"
 
     msg_text = message.text or message.caption or ""
-    logger.info(f"[INCOMING] Account '{c.name}' caught channel post ID {message.id} from '{sender_name}' in Chat {message.chat.id}: '{msg_text}'")
+    logger.info(f"[INCOMING] Account '{c.name}' caught message/post ID {message.id} from '{sender_name}' in Chat {message.chat.id}: '{msg_text}'")
 
     if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
         logger.info(f"[DEBUG] Ignored post from non-target chat: {message.chat.id}")
@@ -75,7 +74,7 @@ async def handle_incoming(c: Client, message: Message):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                logger.info(f"[WEBHOOK] Forwarded channel post {message.id} to n8n (HTTP Status: {resp.status})")
+                logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
     except Exception as e:
         logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
 
@@ -148,26 +147,26 @@ async def main():
     for acc_id, client in clients.items():
         client.add_handler(MessageHandler(handle_incoming))
 
-    # Start sessions and ensure channel subscription/peer caching
+    # Start sessions and cache peers via dialog lookup
     for acc_id, client in clients.items():
         logger.info(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
 
         if TARGET_GROUP_CHAT_ID != 0:
             try:
-                # Attempt to join/subscribe to the channel to activate push updates
-                await client.join_chat(TARGET_GROUP_CHAT_ID)
-                logger.info(f"[{acc_id}] Joined/Subscribed to channel {TARGET_GROUP_CHAT_ID}")
-            except UserAlreadyParticipant:
-                logger.info(f"[{acc_id}] Already subscribed to channel {TARGET_GROUP_CHAT_ID}")
-            except RPCError as e:
-                logger.info(f"[{acc_id}] Peer caching lookup ({e})")
-
-            try:
-                await client.get_chat(TARGET_GROUP_CHAT_ID)
-                logger.info(f"[{acc_id}] Channel peer cached successfully.")
+                cached = False
+                async for dialog in client.get_dialogs(limit=100):
+                    if dialog.chat.id == TARGET_GROUP_CHAT_ID:
+                        logger.info(f"[{acc_id}] Channel '{dialog.chat.title}' found and cached!")
+                        cached = True
+                        break
+                
+                if not cached:
+                    logger.info(f"[{acc_id}] Channel not in recent dialogs, performing direct lookup...")
+                    await client.get_chat(TARGET_GROUP_CHAT_ID)
+                    logger.info(f"[{acc_id}] Channel peer cached via direct lookup.")
             except Exception as e:
-                logger.warning(f"[{acc_id}] Could not resolve peer for channel {TARGET_GROUP_CHAT_ID}: {e}")
+                logger.warning(f"[{acc_id}] Warning: Could not resolve peer for channel {TARGET_GROUP_CHAT_ID}: {e}")
 
     app = web.Application()
 
