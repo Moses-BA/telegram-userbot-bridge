@@ -3,7 +3,7 @@ import json
 import asyncio
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
@@ -29,11 +29,12 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
-# Inbound Group Message Handler
+# Inbound Message Handler (Catch-All)
 async def handle_incoming(client: Client, message: Message):
     sender_name = message.from_user.username if message.from_user else "Unknown"
     print(f"[INCOMING] Account '{client.name}' caught message from @{sender_name} in Chat ID ({message.chat.id}): '{message.text or message.caption or ''}'")
 
+    # Filter out messages not from our target group if configured
     if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
         print(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
         return
@@ -124,11 +125,11 @@ async def main():
         print("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
 
-    # Attach listener to ALL accounts
+    # Attach unfiltered message handler to ALL clients
     for acc_id, client in clients.items():
-        client.add_handler(MessageHandler(handle_incoming, filters.group | filters.private))
+        client.add_handler(MessageHandler(handle_incoming))
 
-    # Start sessions and sync group message history to force Telegram update subscription
+    # Start sessions and cache peers
     for acc_id, client in clients.items():
         print(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
@@ -140,7 +141,6 @@ async def main():
                     if dialog.chat.id == TARGET_GROUP_CHAT_ID:
                         print(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
                         cached = True
-                        # Warm up update stream by fetching recent history
                         async for _ in client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=1):
                             pass
                         break
@@ -165,7 +165,8 @@ async def main():
     print(f"Bridge active on port {PORT}...")
     await site.start()
 
-    await asyncio.Event().wait()
+    print("Pyrogram active. Entering idle event loop...")
+    await idle()
 
 if __name__ == "__main__":
     asyncio.run(main())
