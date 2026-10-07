@@ -34,7 +34,6 @@ async def handle_incoming(client: Client, message: Message):
     sender_name = message.from_user.username if message.from_user else "Unknown"
     print(f"[INCOMING] Account '{client.name}' caught message from @{sender_name} in Chat ID ({message.chat.id}): '{message.text or message.caption or ''}'")
 
-    # Filter out messages not from our target chat
     if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
         print(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
         return
@@ -60,7 +59,31 @@ async def handle_incoming(client: Client, message: Message):
     except Exception as e:
         print(f"[ERROR] Failed to forward payload to n8n: {e}")
 
-# Health Check Handler for Render & UptimeRobot
+# Manual Test Trigger Endpoint (Render -> n8n Verification)
+async def test_trigger_handler(request):
+    if not N8N_WEBHOOK_URL:
+        return web.json_response({"status": "error", "message": "N8N_WEBHOOK_URL is empty"}, status=400)
+    
+    dummy_payload = {
+        "telegram_msg_id": 99999,
+        "sender_user_id": "123456789",
+        "sender_username": "test_user",
+        "text": "Manual trigger test from Render bridge",
+        "reply_to_message_id": None,
+        "chat_id": TARGET_GROUP_CHAT_ID,
+        "handled_by_account": "SYSTEM_TEST"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, json=dummy_payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                print(f"[TEST TRIGGER] Manual test sent to n8n. HTTP Status: {resp.status}")
+                return web.json_response({"status": "success", "n8n_http_status": resp.status})
+    except Exception as e:
+        print(f"[TEST TRIGGER ERROR] Failed to hit n8n: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# Health Check Handler
 async def health_check_handler(request):
     return web.json_response({
         "status": "ok",
@@ -101,11 +124,11 @@ async def main():
         print("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
 
-    # Attach listener to ALL accounts without Pyrogram-level chat filters
+    # Attach listener to ALL accounts
     for acc_id, client in clients.items():
         client.add_handler(MessageHandler(handle_incoming, filters.group | filters.private))
 
-    # Start sessions and warm up peer cache
+    # Start sessions and sync group message history to force Telegram update subscription
     for acc_id, client in clients.items():
         print(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
@@ -117,6 +140,9 @@ async def main():
                     if dialog.chat.id == TARGET_GROUP_CHAT_ID:
                         print(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
                         cached = True
+                        # Warm up update stream by fetching recent history
+                        async for _ in client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=1):
+                            pass
                         break
                 
                 if not cached:
@@ -130,6 +156,7 @@ async def main():
     # Registered routes
     app.router.add_get("/", health_check_handler)
     app.router.add_get("/healthz", health_check_handler)
+    app.router.add_get("/test-trigger", test_trigger_handler)
     app.router.add_post("/send", send_message_handler)
 
     runner = web.AppRunner(app)
