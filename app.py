@@ -5,14 +5,18 @@ import logging
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
+from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
-# Enable standard Python logging for Pyrogram background tasks
+# Enable standard Python & Pyrogram DEBUG logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("telegram-bridge")
+
+# Set Pyrogram dispatcher to DEBUG to catch raw network packets
+logging.getLogger("pyrogram.dispatcher").setLevel(logging.DEBUG)
 
 # Load environment variables
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -36,37 +40,35 @@ for account_id, session_str in SESSIONS.items():
         in_memory=True
     )
 
-# Register message handlers on every client session
-for acc_id, client in clients.items():
-    @client.on_message()
-    async def handle_incoming(c: Client, message: Message):
-        sender_name = message.from_user.username if message.from_user else "Unknown"
-        logger.info(f"[INCOMING] Account '{c.name}' received message ID {message.id} from @{sender_name} in Chat {message.chat.id}: '{message.text or message.caption or ''}'")
+# Inbound Message Handler
+async def handle_incoming(c: Client, message: Message):
+    sender_name = message.from_user.username if message.from_user else "Unknown"
+    logger.info(f"[INCOMING] Account '{c.name}' caught message ID {message.id} from @{sender_name} in Chat {message.chat.id}: '{message.text or message.caption or ''}'")
 
-        if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
-            logger.info(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
-            return
+    if TARGET_GROUP_CHAT_ID != 0 and message.chat.id != TARGET_GROUP_CHAT_ID:
+        logger.info(f"[DEBUG] Ignored message from non-target chat: {message.chat.id}")
+        return
 
-        if not N8N_WEBHOOK_URL:
-            logger.error("[ERROR] N8N_WEBHOOK_URL environment variable is empty.")
-            return
+    if not N8N_WEBHOOK_URL:
+        logger.error("[ERROR] N8N_WEBHOOK_URL environment variable is empty.")
+        return
 
-        payload = {
-            "telegram_msg_id": message.id,
-            "sender_user_id": str(message.from_user.id) if message.from_user else None,
-            "sender_username": sender_name,
-            "text": message.text or message.caption or "",
-            "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
-            "chat_id": message.chat.id,
-            "handled_by_account": c.name
-        }
+    payload = {
+        "telegram_msg_id": message.id,
+        "sender_user_id": str(message.from_user.id) if message.from_user else None,
+        "sender_username": sender_name,
+        "text": message.text or message.caption or "",
+        "reply_to_message_id": message.reply_to_message.id if message.reply_to_message else None,
+        "chat_id": message.chat.id,
+        "handled_by_account": c.name
+    }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
-        except Exception as e:
-            logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                logger.info(f"[WEBHOOK] Forwarded message {message.id} to n8n (HTTP Status: {resp.status})")
+    except Exception as e:
+        logger.error(f"[ERROR] Failed to forward payload to n8n: {e}")
 
 # Manual Test Trigger Endpoint
 async def test_trigger_handler(request):
@@ -133,7 +135,11 @@ async def main():
         logger.critical("[CRITICAL] No client sessions found in SESSIONS_JSON environment variable.")
         return
 
-    # Start sessions and cache peers
+    # Explicitly register handlers on every client
+    for acc_id, client in clients.items():
+        client.add_handler(MessageHandler(handle_incoming))
+
+    # Start sessions and cache group peers
     for acc_id, client in clients.items():
         logger.info(f"Starting Pyrogram session for {acc_id}...")
         await client.start()
@@ -145,8 +151,6 @@ async def main():
                     if dialog.chat.id == TARGET_GROUP_CHAT_ID:
                         logger.info(f"[{acc_id}] Group '{dialog.chat.title}' found and cached!")
                         cached = True
-                        async for _ in client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=1):
-                            pass
                         break
                 
                 if not cached:
@@ -154,6 +158,18 @@ async def main():
                     logger.info(f"[{acc_id}] Group peer cached via direct lookup.")
             except Exception as e:
                 logger.warning(f"[{acc_id}] Warning: Could not resolve peer for group {TARGET_GROUP_CHAT_ID}: {e}")
+
+    # Outbound Self-Test: ACC_01 posts to group to trigger ACC_02-ACC_05
+    if "ACC_01" in clients and TARGET_GROUP_CHAT_ID != 0:
+        try:
+            logger.info("Sending automated startup test message from ACC_01...")
+            sent = await clients["ACC_01"].send_message(
+                chat_id=TARGET_GROUP_CHAT_ID,
+                text="🤖 Bridge online: Automated inbound test message."
+            )
+            logger.info(f"Startup message posted by ACC_01 (Msg ID: {sent.id})")
+        except Exception as e:
+            logger.error(f"Failed to post startup test message: {e}")
 
     app = web.Application()
 
