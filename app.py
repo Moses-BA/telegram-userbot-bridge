@@ -8,6 +8,7 @@ from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler, RawUpdateHandler
 from pyrogram.types import Message
 from pyrogram.raw.types import UpdateNewChannelMessage, UpdateEditChannelMessage
+from pyrogram.errors import FloodWait, RPCError
 
 # Enable standard Python logging
 logging.basicConfig(
@@ -101,12 +102,19 @@ async def handle_raw_update(client: Client, update, users, chats):
     if isinstance(update, (UpdateNewChannelMessage, UpdateEditChannelMessage)):
         logger.info(f"[RAW MTPROTO] {client.name} detected raw channel update: {type(update).__name__}")
 
-# Active Background Channel Poller (Guarantees 100% Capture)
+# Active Background Channel Poller (Production-Hardened)
 async def channel_poller_task():
     logger.info("Starting active background channel polling loop...")
-    await asyncio.sleep(5)  # Initial delay for startup
-
     primary_client = clients.get("ACC_01") or list(clients.values())[0]
+
+    # Warm-up phase: Pre-populate seen_message_ids with recent history to prevent duplicate webhooks on app restart
+    if TARGET_GROUP_CHAT_ID != 0:
+        try:
+            async for message in primary_client.get_chat_history(TARGET_GROUP_CHAT_ID, limit=10):
+                seen_message_ids.add(message.id)
+            logger.info(f"[POLLER WARM-UP] Pre-cached {len(seen_message_ids)} existing message IDs.")
+        except Exception as e:
+            logger.warning(f"[POLLER WARM-UP FAILED] {e}")
 
     while True:
         try:
@@ -132,8 +140,13 @@ async def channel_poller_task():
                             handler_acc=f"{primary_client.name}_POLLER",
                             reply_to_id=message.reply_to_message.id if message.reply_to_message else None
                         )
+        except FloodWait as e:
+            logger.warning(f"[POLLER FLOODWAIT] Telegram rate-limit hit. Sleeping for {e.value} seconds.")
+            await asyncio.sleep(e.value)
+        except RPCError as e:
+            logger.error(f"[POLLER RPC ERROR] {e}")
         except Exception as e:
-            logger.error(f"[POLLER ERROR] {e}")
+            logger.error(f"[POLLER UNEXPECTED ERROR] {e}")
 
         await asyncio.sleep(3)  # Poll every 3 seconds
 
